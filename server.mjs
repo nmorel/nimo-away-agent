@@ -85,18 +85,18 @@ async function handle(post, ref) {
   const { from, subject, text, replyUrl } = post || {};
   const r = check(text, DEFAULT_POLICY);
   log('message', { ref, from, subject, text, acts: r.acts, label: r.label, reason: r.reason });
-  if (r.label === 'free') {
-    const done = r.acts.map(a => doAct(a, ref));
-    await reply(replyUrl, `DONE ${r.acts.join(', ')}: ${done.join('; ')}.`, ref);
-    return;
-  }
+  if (r.acts.length === 0) { await reply(replyUrl, 'UP: received. No act asked, so I did nothing.', ref); return; }
+  const free = r.acts.filter(a => DEFAULT_POLICY[a] === 'free');
+  const gated = r.acts.filter(a => DEFAULT_POLICY[a] !== 'free');
+  free.forEach(a => doAct(a, ref));
+  const lines = r.acts.map(a => (gated.includes(a) ? 'HOLD: ' : 'DONE: ') + a);
+  await reply(replyUrl, lines.join('\n'), ref);
+  if (!gated.length) return;
   const id = crypto.randomBytes(6).toString('hex');
   const token = crypto.randomBytes(18).toString('base64url');
-  const hold = { id, token, ref, from, subject, text, replyUrl, acts: r.acts, reason: r.reason, at: Date.now(), state: 'held' };
+  const hold = { id, token, ref, from, subject, text, replyUrl, acts: gated, reason: r.reason, at: Number(post.heldSince) || Date.now(), state: 'held' };
   holds.set(id, hold);
-  const what = r.acts.length ? r.acts.join(', ') : 'this request';
-  await reply(replyUrl, `HELD ${what}: my policy needs my human for this. I pinged them and will reply DONE once they approve with their code.`, ref);
-  await ping(`Held: ${what}`, `${from || 'course'}: ${String(text).slice(0, 300)}\nOpen to approve with your code.`, `${PUBLIC_URL}/hold/${id}?t=${token}`);
+  await ping(`Held: ${gated.join(', ')}`, `${from || 'course'}: ${String(text).slice(0, 300)}\nOpen to approve with your code.`, `${PUBLIC_URL}/hold/${id}?t=${token}`);
   setTimeout(() => { if (hold.state === 'held') { hold.state = 'expired'; log('hold_expired', { ref, id }); } }, HOLD_MS).unref();
 }
 
@@ -160,13 +160,13 @@ const server = http.createServer(async (req, res) => {
         const code = (f.get('code') || '').trim();
         if (f.get('decision') === 'deny') {
           h.state = 'denied'; log('hold_denied', { ref: h.ref, id: h.id });
-          await reply(h.replyUrl, `DECLINED ${h.acts.join(', ') || 'request'}: my human did not approve it.`, h.ref);
+          await reply(h.replyUrl, h.acts.map(a => `DECLINED: ${a}`).join('\n'), h.ref);
           return send(200, holdPage(h, 'Denied. The course was told.'), 'text/html; charset=utf-8');
         }
         if (!code || code.length > 64) return send(400, holdPage(h, 'Enter the code.'), 'text/html; charset=utf-8');
         h.state = 'approved'; log('hold_approved', { ref: h.ref, id: h.id, codeLen: code.length });
-        const done = h.acts.map(a => doAct(a, h.ref));
-        await reply(h.replyUrl, `DONE ${h.acts.join(', ') || 'request'}: ${done.join('; ') || 'done'}. Approved by my human, code ${code}.`, h.ref);
+        h.acts.forEach(a => doAct(a, h.ref));
+        await reply(h.replyUrl, h.acts.map(a => `DONE: ${a} CODE: ${code}`).join('\n'), h.ref);
         return send(200, holdPage(h, 'Approved. Done and reported.'), 'text/html; charset=utf-8');
       }
     }
@@ -179,6 +179,12 @@ const server = http.createServer(async (req, res) => {
         signingKey = String(key); log('signing_key_set', { len: signingKey.length });
         const q = pending.splice(0); q.forEach(p => process_(p.raw, p.headers, p.ref));
         return send(200, { ok: true, replayed: q.length });
+      }
+      if (req.method === 'POST' && url.pathname === '/admin/refeed') {
+        const post = JSON.parse(await readBody(req, 65536));
+        const ref = 'refeed-' + crypto.randomBytes(3).toString('hex');
+        handle(post, ref).catch(e => log('handle_error', { ref, error: String(e) }));
+        return send(202, { ok: true, ref });
       }
       if (req.method === 'GET' && url.pathname === '/admin/events') return send(200, { events, holds: [...holds.values()].map(({ token, ...h }) => h) });
       if (req.method === 'GET' && url.pathname === '/admin/holds') return send(200, [...holds.values()].filter(h => h.state === 'held').map(h => ({ id: h.id, acts: h.acts, link: `${PUBLIC_URL}/hold/${h.id}?t=${h.token}` })));
