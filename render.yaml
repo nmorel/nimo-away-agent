@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: nimo-away-agent
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: "true"
+    startCommand: node server.mjs
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: OWNER_SECRET
+        sync: false
+      - key: NTFY_TOPIC
+        sync: false

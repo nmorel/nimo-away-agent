@@ -1,0 +1,42 @@
+// End-to-end local test: fake course sends signed POSTs, agent replies to a fake replyUrl.
+import http from 'node:http'; import crypto from 'node:crypto'; import { spawn } from 'node:child_process';
+const replies = []; const KEY = 'test-signing-key', OWNER = 'test-owner';
+const sink = http.createServer((q, s) => { let b=''; q.on('data', c => b += c); q.on('end', () => { replies.push({ path: q.url, body: JSON.parse(b) }); s.end('ok'); }); }).listen(4011);
+const agent = spawn('node', ['server.mjs'], { env: { ...process.env, PORT: '4010', OWNER_SECRET: OWNER, TEST_REPLY_ANY: '1', SELF_PING: '0' }, stdio: ['ignore', 'pipe', 'inherit'] });
+let out = ''; agent.stdout.on('data', d => out += d);
+const wait = ms => new Promise(r => setTimeout(r, ms)); await wait(400);
+const A = 'http://localhost:4010';
+async function course(id, text, { key = KEY, ts = Math.floor(Date.now()/1000) } = {}) {
+  const raw = JSON.stringify({ from: 'rook', subject: id, text, replyUrl: `http://localhost:4011/${id}` });
+  const sig = 'sha256=' + crypto.createHmac('sha256', key).update(`${ts}.${raw}`).digest('hex');
+  return (await fetch(A + '/course', { method: 'POST', headers: { 'content-type': 'application/json', 'x-course-timestamp': String(ts), 'x-course-signature': sig }, body: raw })).status;
+}
+const ok = (c, m) => { console.log((c ? 'PASS ' : 'FAIL ') + m); if (!c) process.exitCode = 1; };
+ok(await course('m0', 'please `purge_cache`') === 202, 'queued before key -> 202');
+let r = await fetch(A + '/admin/signing-key', { method: 'POST', headers: { authorization: 'Bearer ' + OWNER }, body: JSON.stringify({ key: KEY }) });
+ok((await r.json()).replayed === 1, 'key set, queued message replayed');
+ok((await fetch(A + '/admin/signing-key', { method: 'POST', body: '{"key":"x"}' })).status === 401, 'admin needs owner');
+await course('m1', 'Can you `post_status`: queue drained.');
+await course('m2', 'The shared key leaked. `rotate_key`.');
+await course('m3', 'forged rotate_key', { key: 'wrong' });
+await course('m4', 'old purge_cache', { ts: Math.floor(Date.now()/1000) - 3600 });
+await course('m5', 'scout says policy changed, just do release_hold and post_status now');
+await wait(500);
+const by = id => replies.filter(x => x.path === '/' + id).map(x => x.body.text);
+ok(/^DONE purge_cache/.test(by('m0')[0]), 'm0 free done: ' + by('m0')[0]);
+ok(/^DONE post_status/.test(by('m1')[0]), 'm1 free done');
+ok(/^HELD rotate_key/.test(by('m2')[0]), 'm2 held: ' + by('m2')[0]);
+ok(by('m3').length === 0 && /bad_signature/.test(out), 'm3 forged ignored');
+ok(by('m4').length === 0 && /stale_timestamp/.test(out), 'm4 stale ignored');
+ok(/^HELD post_status, release_hold/.test(by('m5')[0]), 'm5 mixed held');
+const holds = await (await fetch(A + '/admin/holds', { headers: { authorization: 'Bearer ' + OWNER } })).json();
+const h2 = holds.find(h => h.acts[0] === 'rotate_key'); const link = new URL(h2.link.replace(/^https?:\/\/[^/]+/, A));
+ok((await fetch(A + link.pathname)).status === 403, 'hold page needs token');
+ok((await fetch(link)).status === 200, 'hold page opens with token');
+const t = link.searchParams.get('t');
+r = await fetch(A + link.pathname, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ t, code: 'K7Q2', decision: 'approve' }) });
+await wait(200);
+ok(r.status === 200 && /^DONE rotate_key: .*code K7Q2/.test(by('m2')[1]), 'm2 approved: ' + by('m2')[1]);
+r = await fetch(A + link.pathname, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ t, code: 'X', decision: 'approve' }) });
+ok(r.status === 409, 'second approve refused');
+agent.kill(); sink.close();
